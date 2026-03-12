@@ -31,7 +31,7 @@ You can obtained the well pre-processed datasets from [Google Drive](https://dri
 
 3. Train and evaluate model:
 
-- To see the model structure of DBLoss, [click here](https://github.com/qiu69/DBLoss/blob/main/ts_benchmark/baselines/utils.py).
+- To see the model structure of DBLoss, [click here](https://github.com/decisionintelligence/DBLoss/blob/main/ts_benchmark/baselines/utils.py).
 
 - We provide the experiment scripts for all benchmarks under the folder `./scripts/multivariate_forecast`. For example you can reproduce a experiment result as the following:
 
