@@ -16,7 +16,8 @@ from ts_benchmark.baselines.utils import (
     forecasting_data_provider,
     train_val_split,
     get_time_mark,
-    DBLoss
+    DBLoss,
+    FreLoss,
 )
 from ts_benchmark.models.model_base import ModelBase, BatchMaker
 from ts_benchmark.utils.data_processing import split_time
@@ -37,7 +38,10 @@ DEFAULT_HYPER_PARAMS = {
     "adj_lr_in_batch": False,
     "parallel_strategy": None,
     "alpha": 0.2,
-    "beta": 0.5
+    "beta": 0.5,
+    "lambda_low": 0.1,
+    "lambda_mid": 0.1,
+    "lambda_high": 0.1,
 }
 
 
@@ -135,6 +139,12 @@ class DeepForecastingModelBase(ModelBase):
             criterion = nn.L1Loss()
         elif self.config.loss == "DBLoss":
             criterion = DBLoss(self.config.alpha, self.config.beta)
+        elif self.config.loss == "FreLoss":
+            criterion = FreLoss(
+                self.config.lambda_low,
+                self.config.lambda_mid,
+                self.config.lambda_high,
+            )
         else:
             criterion = nn.HuberLoss(delta=0.5)
 

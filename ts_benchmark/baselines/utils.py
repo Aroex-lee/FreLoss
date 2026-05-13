@@ -69,6 +69,38 @@ class DBLoss(nn.Module):
         return self.beta * season_loss + (1 - self.beta) * trend_loss
 
 
+class FreLoss(nn.Module):
+    """Time-domain MSE plus weighted frequency-band loss."""
+
+    def __init__(self, lambda_low, lambda_mid, lambda_high):
+        super().__init__()
+        self.lambda_low = lambda_low
+        self.lambda_mid = lambda_mid
+        self.lambda_high = lambda_high
+
+    @staticmethod
+    def _safe_mean(x):
+        return x.mean() if x.numel() > 0 else x.new_tensor(0.0)
+
+    def forward(self, outputs, batch_y):
+        loss_time = ((outputs - batch_y) ** 2).mean()
+        freq_error = (
+            torch.fft.rfft(outputs, dim=1) - torch.fft.rfft(batch_y, dim=1)
+        ).abs()
+
+        low_freq, mid_freq, high_freq = torch.tensor_split(freq_error, 3, dim=1)
+        loss_low = self._safe_mean(low_freq)
+        loss_mid = self._safe_mean(mid_freq)
+        loss_high = self._safe_mean(high_freq)
+
+        return (
+            loss_time
+            + self.lambda_low * loss_low
+            + self.lambda_mid * loss_mid
+            + self.lambda_high * loss_high
+        )
+
+
 def adjust_learning_rate(optimizer, epoch, args):
     # lr = args.learning_rate * (0.2 ** (epoch // 2))
     if args.lradj == "type1":
