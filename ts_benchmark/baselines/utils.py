@@ -74,9 +74,15 @@ class FreLoss(nn.Module):
 
     def __init__(self, lambda_low, lambda_mid, lambda_high):
         super().__init__()
-        self.lambda_low = lambda_low
-        self.lambda_mid = lambda_mid
-        self.lambda_high = lambda_high
+        self.set_weights(lambda_low, lambda_mid, lambda_high)
+
+    def set_weights(self, lambda_low, lambda_mid, lambda_high):
+        self.lambda_low = float(lambda_low)
+        self.lambda_mid = float(lambda_mid)
+        self.lambda_high = float(lambda_high)
+
+    def get_weights(self):
+        return self.lambda_low, self.lambda_mid, self.lambda_high
 
     @staticmethod
     def _safe_mean(x):
@@ -99,6 +105,88 @@ class FreLoss(nn.Module):
             + self.lambda_mid * loss_mid
             + self.lambda_high * loss_high
         )
+
+
+class GaussianFreLossPolicy:
+    """Gaussian policy controller for adaptive frequency-band weights."""
+
+    def __init__(
+        self,
+        mu_init=-2.0,
+        sigma_init=1.0,
+        sigma_min=0.05,
+        sigma_decay=0.95,
+        policy_lr=0.01,
+        lambda_max=1.0,
+        baseline_beta=0.9,
+        reward_penalty=0.0,
+    ):
+        self.mu = np.full(3, float(mu_init), dtype=np.float64)
+        self.sigma = np.full(3, float(sigma_init), dtype=np.float64)
+        self.sigma_min = float(sigma_min)
+        self.sigma_decay = float(sigma_decay)
+        self.policy_lr = float(policy_lr)
+        self.lambda_max = float(lambda_max)
+        self.baseline_beta = float(baseline_beta)
+        self.reward_penalty = float(reward_penalty)
+        self.reward_baseline = 0.0
+        self._has_baseline = False
+        self.last_z = None
+        self.last_lambdas = None
+
+    @staticmethod
+    def _sigmoid(x):
+        x = np.clip(x, -60.0, 60.0)
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def sample(self):
+        self.last_z = np.random.normal(self.mu, self.sigma)
+        self.last_lambdas = self.lambda_max * self._sigmoid(self.last_z)
+        return self.current_lambdas()
+
+    def current_lambdas(self):
+        lambdas = (
+            self.lambda_max * self._sigmoid(self.mu)
+            if self.last_lambdas is None
+            else self.last_lambdas
+        )
+        return tuple(float(value) for value in lambdas)
+
+    def mean_lambdas(self):
+        lambdas = self.lambda_max * self._sigmoid(self.mu)
+        return tuple(float(value) for value in lambdas)
+
+    def update(self, reward):
+        if self.last_z is None or self.last_lambdas is None:
+            raise RuntimeError("Policy must sample before it can be updated.")
+
+        adjusted_reward = float(reward) - self.reward_penalty * float(
+            np.sum(self.last_lambdas)
+        )
+        baseline = self.reward_baseline if self._has_baseline else 0.0
+        advantage = adjusted_reward - baseline
+        sigma_sq = np.maximum(self.sigma**2, 1e-12)
+
+        self.mu += self.policy_lr * advantage * (self.last_z - self.mu) / sigma_sq
+        self.sigma = np.maximum(self.sigma_min, self.sigma * self.sigma_decay)
+
+        if self._has_baseline:
+            self.reward_baseline = (
+                self.baseline_beta * self.reward_baseline
+                + (1 - self.baseline_beta) * adjusted_reward
+            )
+        else:
+            self.reward_baseline = adjusted_reward
+            self._has_baseline = True
+
+        return {
+            "reward": float(reward),
+            "adjusted_reward": adjusted_reward,
+            "advantage": advantage,
+            "mu": tuple(float(value) for value in self.mu),
+            "sigma": tuple(float(value) for value in self.sigma),
+            "mean_lambdas": self.mean_lambdas(),
+        }
 
 
 def adjust_learning_rate(optimizer, epoch, args):

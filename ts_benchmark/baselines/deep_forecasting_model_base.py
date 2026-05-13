@@ -18,6 +18,7 @@ from ts_benchmark.baselines.utils import (
     get_time_mark,
     DBLoss,
     FreLoss,
+    GaussianFreLossPolicy,
 )
 from ts_benchmark.models.model_base import ModelBase, BatchMaker
 from ts_benchmark.utils.data_processing import split_time
@@ -42,6 +43,16 @@ DEFAULT_HYPER_PARAMS = {
     "lambda_low": 0.1,
     "lambda_mid": 0.1,
     "lambda_high": 0.1,
+    "adaptive_freloss": False,
+    "freloss_policy_mu_init": -2.0,
+    "freloss_policy_sigma_init": 1.0,
+    "freloss_policy_sigma_min": 0.05,
+    "freloss_policy_sigma_decay": 0.95,
+    "freloss_policy_lr": 0.01,
+    "freloss_policy_lambda_max": 1.0,
+    "freloss_policy_warmup_epochs": 1,
+    "freloss_policy_baseline_beta": 0.9,
+    "freloss_policy_reward_penalty": 0.0,
 }
 
 
@@ -329,7 +340,11 @@ class DeepForecastingModelBase(ModelBase):
         return padding_mark
 
     def validate(
-        self, valid_data_loader: DataLoader, series_dim: int, criterion: torch.nn.Module
+        self,
+        valid_data_loader: DataLoader,
+        series_dim: int,
+        criterion: torch.nn.Module,
+        include_additional_loss: bool = True,
     ) -> float:
         """
         Validates the model performance on the provided validation dataset.
@@ -359,7 +374,9 @@ class DeepForecastingModelBase(ModelBase):
                 target = target[:, -config.horizon :, :series_dim]
                 output = output[:, -config.horizon :, :series_dim]
                 output, target = self._post_process(output, target)
-                all_loss = criterion(output, target) + additional_loss
+                all_loss = criterion(output, target)
+                if include_additional_loss:
+                    all_loss = all_loss + additional_loss
                 loss = all_loss.detach().cpu().numpy()
                 total_loss.append(loss)
 
@@ -446,6 +463,31 @@ class DeepForecastingModelBase(ModelBase):
 
         # Define the loss function and optimizer
         criterion, optimizer = self._init_criterion_and_optimizer()
+        adaptive_freloss = (
+            config.loss == "FreLoss"
+            and config.adaptive_freloss
+            and train_ratio_in_tv != 1
+            and isinstance(criterion, FreLoss)
+        )
+        freloss_policy = None
+        valid_mse_criterion = nn.MSELoss()
+        if adaptive_freloss:
+            freloss_policy = GaussianFreLossPolicy(
+                mu_init=config.freloss_policy_mu_init,
+                sigma_init=config.freloss_policy_sigma_init,
+                sigma_min=config.freloss_policy_sigma_min,
+                sigma_decay=config.freloss_policy_sigma_decay,
+                policy_lr=config.freloss_policy_lr,
+                lambda_max=config.freloss_policy_lambda_max,
+                baseline_beta=config.freloss_policy_baseline_beta,
+                reward_penalty=config.freloss_policy_reward_penalty,
+            )
+            self.freloss_policy = freloss_policy
+            self.best_freloss_weights = criterion.get_weights()
+            criterion.set_weights(0.0, 0.0, 0.0)
+            print("Adaptive FreLoss policy enabled.")
+        elif config.loss == "FreLoss" and config.adaptive_freloss:
+            print("Adaptive FreLoss disabled because no validation split is available.")
 
         if config.use_amp == 1:
             scaler = torch.cuda.amp.GradScaler()
@@ -461,6 +503,31 @@ class DeepForecastingModelBase(ModelBase):
         print(f"Total trainable parameters: {total_params}")
 
         for epoch in range(config.num_epochs):
+            valid_loss_before = None
+            if adaptive_freloss:
+                warmup_epochs = int(config.freloss_policy_warmup_epochs)
+                if epoch < warmup_epochs:
+                    lambdas = (0.0, 0.0, 0.0)
+                    criterion.set_weights(*lambdas)
+                    print(
+                        f"Adaptive FreLoss epoch {epoch + 1}: warmup lambdas={lambdas}"
+                    )
+                else:
+                    valid_loss_before = self.validate(
+                        valid_data_loader,
+                        series_dim,
+                        valid_mse_criterion,
+                        include_additional_loss=False,
+                    )
+                    lambdas = freloss_policy.sample()
+                    criterion.set_weights(*lambdas)
+                    config.lambda_low, config.lambda_mid, config.lambda_high = lambdas
+                    print(
+                        "Adaptive FreLoss epoch {}: sampled lambdas=({:.6f}, {:.6f}, {:.6f})".format(
+                            epoch + 1, *lambdas
+                        )
+                    )
+
             self.model.train()
             # for input, target, input_mark, target_mark in train_data_loader:
             for i, (input, target, input_mark, target_mark) in enumerate(
@@ -499,15 +566,46 @@ class DeepForecastingModelBase(ModelBase):
                     self._adjust_lr(optimizer, epoch + 1, config)
 
             if train_ratio_in_tv != 1:
-                valid_loss = self.validate(valid_data_loader, series_dim, criterion)
+                if adaptive_freloss:
+                    valid_loss = self.validate(
+                        valid_data_loader,
+                        series_dim,
+                        valid_mse_criterion,
+                        include_additional_loss=False,
+                    )
+                    if epoch >= int(config.freloss_policy_warmup_epochs):
+                        reward = valid_loss_before - valid_loss
+                        policy_info = freloss_policy.update(reward)
+                        print(
+                            "Adaptive FreLoss epoch {}: reward={:.6f}, advantage={:.6f}, mean_lambdas=({:.6f}, {:.6f}, {:.6f})".format(
+                                epoch + 1,
+                                policy_info["reward"],
+                                policy_info["advantage"],
+                                *policy_info["mean_lambdas"],
+                            )
+                        )
+                else:
+                    valid_loss = self.validate(valid_data_loader, series_dim, criterion)
                 improved = self.early_stopping(valid_loss, self.model)
                 if improved:
                     self.check_point = self.save_checkpoint(self.model)
+                    if adaptive_freloss:
+                        self.best_freloss_weights = criterion.get_weights()
                 if self.early_stopping.early_stop:
                     break
 
             if self.config.lradj != "TST":
                 self._adjust_lr(optimizer, epoch + 1, config)
+
+        if adaptive_freloss:
+            config.lambda_low, config.lambda_mid, config.lambda_high = (
+                self.best_freloss_weights
+            )
+            print(
+                "Adaptive FreLoss best lambdas=({:.6f}, {:.6f}, {:.6f})".format(
+                    *self.best_freloss_weights
+                )
+            )
 
     def forecast(
         self,
